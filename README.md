@@ -1,8 +1,6 @@
-# Robinhood MCP Server
+# trading-mcp
 
 A Model Context Protocol (MCP) server that provides Robinhood trading functionality to LLM clients like Claude Desktop.
-
-## Overview
 
 This MCP server exposes Robinhood's trading API as a set of tools and resources that can be used by Claude or other LLM clients. It allows you to:
 
@@ -145,3 +143,6 @@ This project uses the Apache 2.0 license.
 ## Disclaimer
 
 This tool is not affiliated with or endorsed by Robinhood. Use at your own risk. Trading stocks involves risk of financial loss.
+=======
+# trading-mcp
+>>>>>>> 8283235e9c35dec8612f86934f77b9e9219a5f3d
