@@ -1,4 +1,5 @@
 # trading-mcp
+[![smithery badge](https://smithery.ai/badge/@joshuajerin/trading-mcp)](https://smithery.ai/server/@joshuajerin/trading-mcp)
 
 A Model Context Protocol (MCP) server that provides Robinhood trading functionality to LLM clients like Claude Desktop.
 
@@ -10,6 +11,14 @@ This MCP server exposes Robinhood's trading API as a set of tools and resources 
 - Track open orders and trading history
 
 ## Setup
+
+### Installing via Smithery
+
+To install trading-mcp for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@joshuajerin/trading-mcp):
+
+```bash
+npx -y @smithery/cli install @joshuajerin/trading-mcp --client claude
+```
 
 ### Prerequisites
 
