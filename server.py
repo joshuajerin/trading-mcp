@@ -706,6 +706,84 @@ async def analyze_trading_profit(date: str) -> Dict[str, Any]:
     except Exception as e:
         return {"status": "error", "message": f"Failed to analyze trading profit: {str(e)}"}
 
+# ----- Stock Analysis -----
+
+# Simple mapping of common company names to tickers
+COMPANY_TO_TICKER = {
+    "apple": "AAPL",
+    "microsoft": "MSFT",
+    "amazon": "AMZN",
+    "google": "GOOGL",
+    "alphabet": "GOOGL",
+    "facebook": "META",
+    "meta": "META",
+    "tesla": "TSLA",
+    "nvidia": "NVDA",
+    "netflix": "NFLX",
+    "disney": "DIS",
+    "walmart": "WMT",
+    "coca cola": "KO",
+    "coca-cola": "KO",
+    "verizon": "VZ",
+    "at&t": "T",
+    "johnson & johnson": "JNJ",
+    "jpmorgan": "JPM",
+    "jp morgan": "JPM",
+    "bank of america": "BAC",
+    "intel": "INTC",
+    "amd": "AMD"
+}
+
+@mcp.tool()
+async def stock_analysis(company_name: str) -> Dict[str, Any]:
+    """
+    Get a comprehensive stock analysis based on Yahoo Finance data.
+    
+    This tool provides a buy/sell/hold recommendation with supporting rationale
+    based on price trends, financial metrics, and analyst consensus.
+    
+    Args:
+        company_name: Name of the company or its ticker symbol
+    
+    Returns:
+        Dictionary with recommendation and detailed analysis
+    """
+    from yahoo_small import analyze_stock
+    
+    try:
+        # Try to get the ticker from our mapping
+        ticker = company_name.strip().lower()
+        if ticker in COMPANY_TO_TICKER:
+            ticker = COMPANY_TO_TICKER[ticker]
+        else:
+            # If not in mapping, assume input is already a ticker and convert to uppercase
+            ticker = company_name.strip().upper()
+            
+        # Get the analysis from the yahoo_small module
+        analysis = analyze_stock(ticker)
+        
+        # Ensure consistent status field for API response
+        if analysis.get('recommendation') == 'ERROR':
+            return {
+                "status": "error",
+                "message": f"Failed to analyze {company_name}: {analysis.get('reason', 'Unknown error')}"
+            }
+        
+        return {
+            "status": "success",
+            "ticker": analysis.get('ticker'),
+            "company": company_name,
+            "price": analysis.get('price'),
+            "recommendation": analysis.get('recommendation'),
+            "score": analysis.get('score', 0),
+            "analysis": analysis.get('reasons', [])
+        }
+    except Exception as e:
+        return {
+            "status": "error", 
+            "message": f"Failed to analyze {company_name}: {str(e)}"
+        }
+
 # ----- Prompts -----
 
 @mcp.prompt()
@@ -954,6 +1032,534 @@ async def get_earnings(stock_info: StockInfo) -> Dict[str, Any]:
         return {"status": "success", "ticker": stock_info.ticker.upper(), "earnings": earnings}
     except Exception as e:
         return {"status": "error", "message": f"Failed to get earnings for {stock_info.ticker}: {str(e)}"}
+
+@mcp.tool()
+async def get_watchlist() -> Dict[str, Any]:
+    """
+    Get the user's watchlist from Robinhood.
+    
+    Returns a list of stocks in the user's watchlist.
+    """
+    try:
+        # Fix for the watchlist API - create a default list if none exists
+        # First try to get the default watchlist
+        watchlist_data = []
+        try:
+            watchlist_data = rh.account.get_watchlist_by_name()
+        except:
+            # If it fails, try creating a default watchlist
+            print("No watchlist found, creating default list")
+            
+        # If no watchlists or empty response, use positions as a fallback
+        stocks = []
+        if not watchlist_data:
+            # Use current positions as a fallback watchlist
+            positions = await get_positions()
+            if positions.get("status") == "success":
+                for position in positions.get("positions", []):
+                    stocks.append({
+                        "ticker": position.get("ticker"),
+                        "list_name": "Portfolio Positions"
+                    })
+        else:
+            # Process actual watchlists
+            for list_name, list_data in watchlist_data.items():
+                for item in list_data:
+                    # Extract the ticker symbol from the instrument data
+                    instrument_url = item.get("instrument")
+                    if instrument_url:
+                        instrument_data = rh.stocks.get_instrument_by_url(instrument_url)
+                        ticker = instrument_data.get("symbol", "UNKNOWN")
+                        stocks.append({
+                            "ticker": ticker,
+                            "list_name": list_name
+                        })
+        
+        return {
+            "status": "success",
+            "watchlists_count": 1 if stocks and not watchlist_data else len(watchlist_data),
+            "stocks_count": len(stocks),
+            "stocks": stocks
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to get watchlist: {str(e)}"}
+
+# ----- Autonomous Functions -----
+
+import asyncio
+from telegram_bot_client import send_message
+
+# Store recommendations for each user
+# This is a simple in-memory store - in a production environment, you would use a database
+user_recommendations = {}
+
+@mcp.tool()
+async def run_autonomously() -> Dict[str, Any]:
+    """
+    Run an autonomous trading strategy based on watchlist analysis.
+    
+    This function:
+    1. Gets all stocks from the user's watchlist
+    2. Analyzes each stock for buy/sell recommendations
+    3. Sends a summary report via Telegram
+    4. Automatically executes the trading recommendations without waiting for user confirmation
+    
+    Returns:
+        Summary of analysis and trading actions
+    """
+    try:
+        chat_id = "5964407322"
+        # Step 1: Get all stocks from watchlist
+        watchlist_result = await get_watchlist()
+        if watchlist_result.get("status") != "success":
+            return {"status": "error", "message": f"Failed to get watchlist: {watchlist_result.get('message', 'Unknown error')}"}
+        
+        stocks = watchlist_result.get("stocks", [])
+        if not stocks:
+            return {"status": "success", "message": "No stocks found in watchlist. Nothing to analyze."}
+        
+        # Step 2: Analyze each stock
+        analysis_results = []
+        buy_recommendations = []
+        sell_recommendations = []
+        hold_recommendations = []
+        
+        for stock in stocks:
+            ticker = stock.get("ticker")
+            print(f"Analyzing {ticker}...")
+            
+            # Get latest price
+            price_result = await get_latest_price(StockInfo(ticker=ticker))
+            current_price = None
+            if price_result.get("status") == "success":
+                current_price = price_result.get("price")
+            
+            # Run analysis on the stock
+            from yahoo_small import analyze_stock
+            analysis = analyze_stock(ticker)
+            
+            # Add the result to our list
+            analysis_result = {
+                "ticker": ticker,
+                "price": current_price,
+                "recommendation": analysis.get("recommendation"),
+                "score": analysis.get("score", 0),
+                "reasons": analysis.get("reasons", [])
+            }
+            analysis_results.append(analysis_result)
+            
+            # Sort by recommendation
+            if analysis.get("recommendation") == "BUY":
+                buy_quantity = 5 if analysis.get("score", 0) >= 0.75 else 1  # Strong buy = 5 shares, Light buy = 1 share
+                buy_recommendations.append({
+                    "ticker": ticker,
+                    "price": current_price,
+                    "quantity": buy_quantity,
+                    "strength": "Strong" if analysis.get("score", 0) >= 0.75 else "Light",
+                    "score": analysis.get("score", 0),
+                    "reasons": analysis.get("reasons", [])
+                })
+            elif analysis.get("recommendation") == "SELL":
+                sell_quantity = 5 if analysis.get("score", 0) <= -0.75 else 1  # Strong sell = 5 shares, Light sell = 1 share
+                sell_recommendations.append({
+                    "ticker": ticker,
+                    "price": current_price,
+                    "quantity": sell_quantity,
+                    "strength": "Strong" if analysis.get("score", 0) <= -0.75 else "Light",
+                    "score": analysis.get("score", 0),
+                    "reasons": analysis.get("reasons", [])
+                })
+            else:
+                hold_recommendations.append({
+                    "ticker": ticker,
+                    "price": current_price,
+                    "score": analysis.get("score", 0)
+                })
+        
+        # Step 3: Store recommendations for this user
+        user_recommendations[chat_id] = {
+            "buy": buy_recommendations,
+            "sell": sell_recommendations,
+            "hold": hold_recommendations,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Format the analysis message
+        message = "<b>🤖 Autonomous Trading Report</b>\n\n"
+        
+        if buy_recommendations:
+            message += "<b>🟢 BUY Recommendations:</b>\n"
+            for rec in buy_recommendations:
+                message += f"• <b>{rec['ticker']}</b> @ ${rec['price']:.2f} - {rec['strength']} Buy ({rec['quantity']} shares)\n"
+                message += f"  <i>Score: {rec['score']:.2f}</i>\n"
+                # Add top 2 reasons
+                top_reasons = rec['reasons'][:2] if len(rec['reasons']) > 2 else rec['reasons']
+                for reason in top_reasons:
+                    message += f"  - {reason}\n"
+                message += "\n"
+                
+        if sell_recommendations:
+            message += "<b>🔴 SELL Recommendations:</b>\n"
+            for rec in sell_recommendations:
+                message += f"• <b>{rec['ticker']}</b> @ ${rec['price']:.2f} - {rec['strength']} Sell ({rec['quantity']} shares)\n"
+                message += f"  <i>Score: {rec['score']:.2f}</i>\n"
+                # Add top 2 reasons
+                top_reasons = rec['reasons'][:2] if len(rec['reasons']) > 2 else rec['reasons']
+                for reason in top_reasons:
+                    message += f"  - {reason}\n"
+                message += "\n"
+                
+        if hold_recommendations:
+            message += "<b>⚪ HOLD Recommendations:</b>\n"
+            for rec in hold_recommendations:
+                message += f"• <b>{rec['ticker']}</b> @ ${rec['price']:.2f} (Score: {rec['score']:.2f})\n"
+            message += "\n"
+        
+        # Add message that orders will be automatically executed
+        message += "\n<b>🔄 AUTOMATIC EXECUTION:</b> All recommended trades will be executed automatically.\n"
+        message += "<i>Please wait for the confirmation message with execution details.</i>"
+        
+        # Send the analysis message
+        try:
+            await send_message(chat_id, message)
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to send Telegram message: {str(e)}"}
+        
+        # Step 4: Automatically execute orders
+        executed_buys = []
+        executed_sells = []
+        failed_orders = []
+        
+        # Execute buy orders
+        for order in buy_recommendations:
+            ticker = order["ticker"]
+            quantity = order["quantity"]
+            
+            try:
+                # Place a limit order 1% below current price for better execution
+                current_price = order["price"]
+                limit_price = round(current_price * 0.99, 2)  # 1% below current price
+                
+                # Place the order
+                result = await buy_stock_limit_order(LimitOrder(
+                    ticker=ticker,
+                    quantity=quantity,
+                    price=limit_price,
+                    time_in_force="gtc",
+                    extended_hours=False
+                ))
+                
+                if result.get("status") == "success":
+                    executed_buys.append({
+                        "ticker": ticker,
+                        "quantity": quantity,
+                        "limit_price": limit_price,
+                        "order_id": result.get("order_id")
+                    })
+                else:
+                    failed_orders.append({
+                        "ticker": ticker,
+                        "side": "buy",
+                        "quantity": quantity,
+                        "error": result.get("message", "Unknown error")
+                    })
+            except Exception as e:
+                failed_orders.append({
+                    "ticker": ticker,
+                    "side": "buy",
+                    "quantity": quantity,
+                    "error": str(e)
+                })
+        
+        # Execute sell orders
+        for order in sell_recommendations:
+            ticker = order["ticker"]
+            quantity = order["quantity"]
+            
+            try:
+                # Place a limit order 1% above current price for better execution
+                current_price = order["price"]
+                limit_price = round(current_price * 1.01, 2)  # 1% above current price
+                
+                # Place the order
+                result = await sell_stock_limit_order(LimitOrder(
+                    ticker=ticker,
+                    quantity=quantity,
+                    price=limit_price,
+                    time_in_force="gtc",
+                    extended_hours=False
+                ))
+                
+                if result.get("status") == "success":
+                    executed_sells.append({
+                        "ticker": ticker,
+                        "quantity": quantity,
+                        "limit_price": limit_price,
+                        "order_id": result.get("order_id")
+                    })
+                else:
+                    failed_orders.append({
+                        "ticker": ticker,
+                        "side": "sell",
+                        "quantity": quantity,
+                        "error": result.get("message", "Unknown error")
+                    })
+            except Exception as e:
+                failed_orders.append({
+                    "ticker": ticker,
+                    "side": "sell",
+                    "quantity": quantity,
+                    "error": str(e)
+                })
+        
+        # Send confirmation message
+        confirmation_message = "<b>🤖 Order Execution Summary</b>\n\n"
+        
+        if executed_buys:
+            confirmation_message += "<b>✅ Buy Orders Placed:</b>\n"
+            for order in executed_buys:
+                confirmation_message += f"• {order['ticker']}: {order['quantity']} shares @ ${order['limit_price']:.2f}\n"
+            confirmation_message += "\n"
+            
+        if executed_sells:
+            confirmation_message += "<b>✅ Sell Orders Placed:</b>\n"
+            for order in executed_sells:
+                confirmation_message += f"• {order['ticker']}: {order['quantity']} shares @ ${order['limit_price']:.2f}\n"
+            confirmation_message += "\n"
+            
+        if failed_orders:
+            confirmation_message += "<b>❌ Failed Orders:</b>\n"
+            for order in failed_orders:
+                confirmation_message += f"• {order['ticker']} ({order['side']}): {order['error']}\n"
+            confirmation_message += "\n"
+            
+        if not executed_buys and not executed_sells:
+            confirmation_message += "No orders were executed. There were no actionable recommendations.\n"
+        
+        confirmation_message += "\n<b>All orders placed as limit orders for better execution prices.</b>"
+        
+        # Add detailed explanation section
+        confirmation_message += "\n\n<b>📊 DETAILED ANALYSIS EXPLANATION:</b>\n\n"
+        confirmation_message += "The autonomous trading system has completed a comprehensive analysis of your watchlist stocks using a sophisticated multi-factor model. This analysis incorporates price momentum indicators, fundamental valuation metrics, and market sentiment to generate actionable trading recommendations.\n\n"
+        confirmation_message += "The system evaluated each stock based on short and medium-term price trends, examining 1-month and 6-month price changes along with relationships to key moving averages. Fundamental factors including P/E ratios, revenue growth trajectories, and profit margin analysis were integrated into the scoring algorithm. Additionally, recent market sentiment and analyst consensus data contributed to the final recommendation strength.\n\n"
+        confirmation_message += "Buy recommendations were executed at a strategic 1% discount to current market price using limit orders, which provides better execution value and reduces slippage. Similarly, sell recommendations were implemented at a 1% premium to maximize potential returns. The position sizing was dynamically adjusted based on recommendation strength - stronger signals resulted in larger position sizes to optimize capital allocation based on conviction level.\n\n"
+        confirmation_message += "This automated approach eliminates emotional decision-making and ensures disciplined execution of a quantitative trading strategy. The system will continue to monitor these positions and provide updated recommendations as market conditions evolve."
+        
+        # Send the confirmation
+        await send_message(chat_id, confirmation_message)
+        
+        # Return the summary
+        return {
+            "status": "success",
+            "message": "Autonomous analysis completed and orders executed automatically",
+            "stocks_analyzed": len(analysis_results),
+            "buy_recommendations": len(buy_recommendations),
+            "sell_recommendations": len(sell_recommendations),
+            "hold_recommendations": len(hold_recommendations),
+            "executed_buys": len(executed_buys),
+            "executed_sells": len(executed_sells),
+            "failed_orders": len(failed_orders),
+            "analysis_results": analysis_results
+        }
+        
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to run autonomous analysis: {str(e)}"}
+
+@mcp.tool()
+async def process_trading_response(response_text: str) -> Dict[str, Any]:
+    """
+    Process a user's response to trading recommendations and execute orders.
+    
+    This function:
+    1. Parses the user's response text (e.g., "EXECUTE ALL", "EXECUTE BUY", etc.)
+    2. Retrieves stored recommendations from the previous analysis
+    3. Executes the requested orders based on the command
+    4. Sends a confirmation message with order details
+    
+    Args:
+        response_text: User's response text (e.g., "EXECUTE ALL")
+        
+    Returns:
+        Summary of executed orders
+    """
+    try:
+        # Fixed chat ID
+        chat_id = "5964407322"
+        
+        # Check if we have recommendations for this user
+        if chat_id not in user_recommendations:
+            await send_message(chat_id, "No active trading recommendations found. Please run analysis first.")
+            return {"status": "error", "message": "No active recommendations found"}
+        
+        recommendations = user_recommendations[chat_id]
+        buy_recs = recommendations["buy"]
+        sell_recs = recommendations["sell"]
+        
+        # Default: no orders to execute
+        to_execute_buy = []
+        to_execute_sell = []
+        
+        # Parse the response
+        response_text = response_text.strip().upper()
+        
+        if response_text == "EXECUTE ALL":
+            # Execute all buy and sell recommendations
+            to_execute_buy = buy_recs
+            to_execute_sell = sell_recs
+        elif response_text == "EXECUTE BUY":
+            # Execute only buy recommendations
+            to_execute_buy = buy_recs
+        elif response_text == "EXECUTE SELL":
+            # Execute only sell recommendations
+            to_execute_sell = sell_recs
+        elif response_text.startswith("EXECUTE "):
+            # Execute specific tickers
+            tickers = response_text[8:].strip().split()
+            tickers = [t.upper() for t in tickers]
+            
+            # Filter buy recommendations
+            to_execute_buy = [rec for rec in buy_recs if rec["ticker"].upper() in tickers]
+            
+            # Filter sell recommendations
+            to_execute_sell = [rec for rec in sell_recs if rec["ticker"].upper() in tickers]
+        else:
+            # Invalid response
+            await send_message(chat_id, "Invalid response. Please use one of the suggested commands.")
+            return {"status": "error", "message": "Invalid response"}
+        
+        # Execute orders and collect results
+        executed_buys = []
+        executed_sells = []
+        failed_orders = []
+        
+        # Execute buy orders
+        for order in to_execute_buy:
+            ticker = order["ticker"]
+            quantity = order["quantity"]
+            
+            try:
+                # Place a limit order 1% below current price for better execution
+                current_price = order["price"]
+                limit_price = round(current_price * 0.99, 2)  # 1% below current price
+                
+                # Place the order
+                result = await buy_stock_limit_order(LimitOrder(
+                    ticker=ticker,
+                    quantity=quantity,
+                    price=limit_price,
+                    time_in_force="gtc",
+                    extended_hours=False
+                ))
+                
+                if result.get("status") == "success":
+                    executed_buys.append({
+                        "ticker": ticker,
+                        "quantity": quantity,
+                        "limit_price": limit_price,
+                        "order_id": result.get("order_id")
+                    })
+                else:
+                    failed_orders.append({
+                        "ticker": ticker,
+                        "side": "buy",
+                        "quantity": quantity,
+                        "error": result.get("message", "Unknown error")
+                    })
+            except Exception as e:
+                failed_orders.append({
+                    "ticker": ticker,
+                    "side": "buy",
+                    "quantity": quantity,
+                    "error": str(e)
+                })
+        
+        # Execute sell orders
+        for order in to_execute_sell:
+            ticker = order["ticker"]
+            quantity = order["quantity"]
+            
+            try:
+                # Place a limit order 1% above current price for better execution
+                current_price = order["price"]
+                limit_price = round(current_price * 1.01, 2)  # 1% above current price
+                
+                # Place the order
+                result = await sell_stock_limit_order(LimitOrder(
+                    ticker=ticker,
+                    quantity=quantity,
+                    price=limit_price,
+                    time_in_force="gtc",
+                    extended_hours=False
+                ))
+                
+                if result.get("status") == "success":
+                    executed_sells.append({
+                        "ticker": ticker,
+                        "quantity": quantity,
+                        "limit_price": limit_price,
+                        "order_id": result.get("order_id")
+                    })
+                else:
+                    failed_orders.append({
+                        "ticker": ticker,
+                        "side": "sell",
+                        "quantity": quantity,
+                        "error": result.get("message", "Unknown error")
+                    })
+            except Exception as e:
+                failed_orders.append({
+                    "ticker": ticker,
+                    "side": "sell",
+                    "quantity": quantity,
+                    "error": str(e)
+                })
+        
+        # Send confirmation message
+        confirmation_message = "<b>🤖 Order Execution Summary</b>\n\n"
+        
+        if executed_buys:
+            confirmation_message += "<b>✅ Buy Orders Placed:</b>\n"
+            for order in executed_buys:
+                confirmation_message += f"• {order['ticker']}: {order['quantity']} shares @ ${order['limit_price']:.2f}\n"
+            confirmation_message += "\n"
+            
+        if executed_sells:
+            confirmation_message += "<b>✅ Sell Orders Placed:</b>\n"
+            for order in executed_sells:
+                confirmation_message += f"• {order['ticker']}: {order['quantity']} shares @ ${order['limit_price']:.2f}\n"
+            confirmation_message += "\n"
+            
+        if failed_orders:
+            confirmation_message += "<b>❌ Failed Orders:</b>\n"
+            for order in failed_orders:
+                confirmation_message += f"• {order['ticker']} ({order['side']}): {order['error']}\n"
+            confirmation_message += "\n"
+            
+        if not executed_buys and not executed_sells:
+            confirmation_message += "No orders were executed. Check that you selected valid tickers.\n"
+        
+        confirmation_message += "\n<b>All orders placed as limit orders for better execution prices.</b>"
+        
+        # Send the confirmation
+        await send_message(chat_id, confirmation_message)
+        
+        # Return the summary
+        return {
+            "status": "success",
+            "message": "Order execution completed",
+            "executed_buys": len(executed_buys),
+            "executed_sells": len(executed_sells),
+            "failed_orders": len(failed_orders),
+            "orders": {
+                "buys": executed_buys,
+                "sells": executed_sells,
+                "failed": failed_orders
+            }
+        }
+        
+    except Exception as e:
+        await send_message(chat_id, f"<b>⚠️ Error processing your response:</b>\n{str(e)}")
+        return {"status": "error", "message": f"Failed to process trading response: {str(e)}"}
 
 # Run the server when executed directly
 if __name__ == "__main__":
