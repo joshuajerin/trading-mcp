@@ -44,6 +44,14 @@ mcp = FastMCP(
     description="A server that provides stock trading functionality through Robinhood"
 )
 
+# Global variable to store login state
+login_state = {
+    "mfa_required": False,
+    "username": None,
+    "password": None,
+    "challenge": None
+}
+
 # ----- Models for request/response data -----
 
 class StockOrder(BaseModel):
@@ -69,6 +77,15 @@ class LoginCredentials(BaseModel):
     password: str = Field(..., description="Robinhood password")
     mfa_code: Optional[str] = Field(None, description="MFA code if required")
 
+class InitialLoginCredentials(BaseModel):
+    """Model for initial login without MFA"""
+    username: str = Field(..., description="Robinhood username (email)")
+    password: str = Field(..., description="Robinhood password")
+
+class MfaCredentials(BaseModel):
+    """Model for MFA code submission"""
+    mfa_code: str = Field(..., description="MFA code from authenticator app")
+
 class StockInfo(BaseModel):
     """Model for stock information"""
     ticker: str = Field(..., description="Stock ticker symbol")
@@ -76,12 +93,132 @@ class StockInfo(BaseModel):
 # ----- Authentication -----
 
 @mcp.tool()
+async def initiate_login(credentials: InitialLoginCredentials) -> Dict[str, Any]:
+    """
+    Initiate login to Robinhood with username and password.
+    
+    This is the first step of the login process. If MFA is required,
+    the response will indicate this and you can then call submit_mfa_code.
+    """
+    try:
+        # Store credentials for MFA step
+        login_state["username"] = credentials.username
+        login_state["password"] = credentials.password
+        login_state["mfa_required"] = False
+        login_state["challenge"] = None
+        
+        # Attempt login without MFA first
+        login_response = rh.login(
+            username=credentials.username,
+            password=credentials.password,
+            mfa_code=None
+        )
+        
+        # If login succeeded without MFA
+        if login_response and "access_token" in login_response:
+            # Clear stored credentials since login completed
+            login_state["username"] = None
+            login_state["password"] = None
+            return {
+                "success": True,
+                "message": "Successfully logged in to Robinhood",
+                "expires_in": login_response.get("expires_in", 86400),
+                "scope": login_response.get("scope", "internal"),
+                "mfa_required": False
+            }
+        else:
+            # Login failed, likely needs MFA
+            login_state["mfa_required"] = True
+            return {
+                "success": False,
+                "message": "MFA code required. Please call submit_mfa_code with your MFA code.",
+                "mfa_required": True
+            }
+            
+    except Exception as e:
+        error_msg = str(e)
+        
+        # Check if the error indicates MFA is required
+        if "mfa" in error_msg.lower() or "two" in error_msg.lower() or "factor" in error_msg.lower():
+            login_state["mfa_required"] = True
+            return {
+                "success": False,
+                "message": "MFA code required. Please call submit_mfa_code with your MFA code.",
+                "mfa_required": True
+            }
+        else:
+            # Clear stored credentials on actual login failure
+            login_state["username"] = None
+            login_state["password"] = None
+            return {
+                "success": False,
+                "message": f"Login failed: {error_msg}",
+                "mfa_required": False
+            }
+
+@mcp.tool()
+async def submit_mfa_code(credentials: MfaCredentials) -> Dict[str, Any]:
+    """
+    Submit MFA code to complete the login process.
+    
+    This should be called after initiate_login returns mfa_required: true.
+    """
+    try:
+        # Check if we're in the right state for MFA submission
+        if not login_state["mfa_required"] or not login_state["username"] or not login_state["password"]:
+            return {
+                "success": False,
+                "message": "No pending MFA login found. Please call initiate_login first."
+            }
+        
+        # Attempt login with stored credentials and provided MFA code
+        login_response = rh.login(
+            username=login_state["username"],
+            password=login_state["password"],
+            mfa_code=credentials.mfa_code
+        )
+        
+        # Clear stored credentials regardless of outcome
+        login_state["username"] = None
+        login_state["password"] = None
+        login_state["mfa_required"] = False
+        login_state["challenge"] = None
+        
+        # Check if login succeeded
+        if login_response and "access_token" in login_response:
+            return {
+                "success": True,
+                "message": "Successfully logged in to Robinhood with MFA",
+                "expires_in": login_response.get("expires_in", 86400),
+                "scope": login_response.get("scope", "internal")
+            }
+        else:
+            return {
+                "success": False,
+                "message": "Login failed with provided MFA code. Please try again."
+            }
+            
+    except Exception as e:
+        # Clear stored credentials on error
+        login_state["username"] = None
+        login_state["password"] = None
+        login_state["mfa_required"] = False
+        login_state["challenge"] = None
+        
+        return {
+            "success": False,
+            "message": f"MFA login failed: {str(e)}"
+        }
+
+@mcp.tool()
 async def login(credentials: LoginCredentials) -> Dict[str, Any]:
     """
-    Login to Robinhood with the provided credentials.
+    Login to Robinhood with the provided credentials (legacy method).
     
     This tool logs in to Robinhood and enables other trading functionalities.
     It stores the authentication token for subsequent requests.
+    
+    Note: For better MFA handling, use initiate_login followed by submit_mfa_code.
     """
     try:
         login_response = rh.login(
